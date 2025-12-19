@@ -4,6 +4,8 @@ A simple CLI tool for downloading content from the streaming platform [hianime.t
 This tool works best if you have a VPN installed with Adblock support, as I have not been able to get a working ad
 blocker working with the chrome session.
 
+python main.py -o archive --aria --continue-on-error \
+
 ## Requirements
 
 - Python3 + PIP3
