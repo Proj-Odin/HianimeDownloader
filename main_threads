@@ -1,0 +1,346 @@
+import argparse
+import os
+import re
+import sys
+import time
+import threading
+import socket
+import ipaddress
+from pathlib import Path
+from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import redirect_stdout, redirect_stderr
+
+from colorama import Fore
+
+from extractors.general import GeneralExtractor
+from extractors.hianime import HianimeExtractor
+from extractors.instagram import InstagramExtractor
+
+
+def slugify(text: str, max_len: int = 80) -> str:
+    text = (text or "").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+    return (text[:max_len] if text else "job")
+
+
+def is_http_url(s: str) -> bool:
+    if not s:
+        return False
+    return s.lower().startswith(("http://", "https://"))
+
+
+def url_points_to_private_network(url: str) -> bool:
+    """
+    Best-effort SSRF guard: resolves hostname and blocks private/loopback/link-local/reserved.
+    """
+    try:
+        host = urlparse(url).hostname
+        if not host:
+            return False
+        # IP literal fast path
+        try:
+            ip = ipaddress.ip_address(host)
+            return (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_reserved
+                or ip.is_multicast
+            )
+        except ValueError:
+            pass
+
+        addrs = {ai[4][0] for ai in socket.getaddrinfo(host, None)}
+        for a in addrs:
+            ip = ipaddress.ip_address(a)
+            if (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_reserved
+                or ip.is_multicast
+            ):
+                return True
+        return False
+    except Exception:
+        # If resolution fails, don't block by default (you may prefer to block).
+        return False
+
+
+class Tee:
+    """Write to multiple streams (console + file)"""
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for s in self.streams:
+            s.write(data)
+
+    def flush(self):
+        for s in self.streams:
+            s.flush()
+
+
+class Main:
+    def __init__(self):
+        self.args = self.parse_args()
+        self._print_lock = threading.Lock()
+
+        Path(self.args.output_dir).mkdir(parents=True, exist_ok=True)
+
+        # If threads>1, isolate jobs by default to avoid collisions
+        if self.args.threads > 1 and not self.args.no_isolate_jobs:
+            self.args.isolate_jobs = True
+
+        jobs = self.build_jobs()
+        if not jobs:
+            jobs = self.interactive_jobs()
+
+        if not jobs:
+            print(f"{Fore.RED}No links/search terms provided. Nothing to do.{Fore.RESET}")
+            return
+
+        # Safety gate for URLs (optional)
+        if not self.args.allow_private_hosts:
+            for item in jobs:
+                if is_http_url(item) and url_points_to_private_network(item):
+                    raise ValueError(
+                        f"Blocked private/loopback/link-local target URL: {item}\n"
+                        f"Use --allow-private-hosts if you really intend this."
+                    )
+
+        if self.args.threads <= 1:
+            total = len(jobs)
+            for idx, item in enumerate(jobs, start=1):
+                self._run_one(item, idx, total)
+            return
+
+        # Concurrent execution
+        total = len(jobs)
+        with ThreadPoolExecutor(max_workers=self.args.threads) as ex:
+            futures = {
+                ex.submit(self._run_one, item, idx, total): (idx, item)
+                for idx, item in enumerate(jobs, start=1)
+            }
+
+            for fut in as_completed(futures):
+                idx, item = futures[fut]
+                try:
+                    fut.result()
+                except Exception as e:
+                    with self._print_lock:
+                        print(f"{Fore.RED}[{idx}/{total}] FAILED: {item}\n  -> {e}{Fore.RESET}")
+                    if not self.args.continue_on_error:
+                        for f in futures:
+                            f.cancel()
+                        raise
+
+    def interactive_jobs(self):
+        os.system("cls" if os.name == "nt" else "clear")
+        print(f"{Fore.LIGHTGREEN_EX}GDown {Fore.LIGHTCYAN_EX}Downloader{Fore.RESET}\n")
+        print("Paste links/search terms (one per line). Blank line to start.\n")
+
+        items = []
+        while True:
+            line = input(f"{Fore.LIGHTYELLOW_EX}> {Fore.RESET}").strip()
+            if not line:
+                break
+            items.append(line)
+
+        return self._dedupe(items)
+
+    def build_jobs(self):
+        jobs = []
+
+        if self.args.link:
+            jobs.extend(self.args.link)
+
+        if self.args.links_file:
+            p = Path(self.args.links_file)
+            if not p.exists():
+                raise FileNotFoundError(f"links file not found: {p}")
+            for line in p.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                jobs.append(line)
+
+        # Old behavior compatibility: treat -n/--filename as a single search term if nothing else provided
+        if not jobs and self.args.filename:
+            jobs.append(self.args.filename)
+
+        return self._dedupe(jobs)
+
+    def _dedupe(self, jobs):
+        seen = set()
+        out = []
+        for j in jobs:
+            if j not in seen:
+                seen.add(j)
+                out.append(j)
+        return out
+
+    def _make_job_args(self, item: str, idx: int, total: int):
+        job_args = argparse.Namespace(**vars(self.args))
+
+        if is_http_url(item):
+            job_args.link = item
+            # keep filename as a base name; if batch + provided, suffix it
+            if job_args.filename and total > 1:
+                job_args.filename = f"{job_args.filename}_{idx:03d}"
+        else:
+            job_args.link = None
+            job_args.filename = item  # treated as hianime search term
+
+        # Optional: isolate each job into its own output directory to prevent collisions
+        if job_args.isolate_jobs:
+            label = slugify(item)
+            job_subdir = f"{idx:03d}_{label}"
+            job_args.output_dir = str(Path(job_args.output_dir) / job_subdir)
+
+        Path(job_args.output_dir).mkdir(parents=True, exist_ok=True)
+        return job_args
+
+    def _run_one(self, item: str, idx: int, total: int):
+        per_start = time.time()
+        job_args = self._make_job_args(item, idx, total)
+
+        # Prepare log file
+        log_fp = None
+        if self.args.log_dir:
+            Path(self.args.log_dir).mkdir(parents=True, exist_ok=True)
+            label = slugify(item)
+            log_path = Path(self.args.log_dir) / f"{idx:03d}_{label}.log"
+            log_fp = open(log_path, "w", encoding="utf-8", errors="replace")
+
+        with self._print_lock:
+            print(f"{Fore.LIGHTCYAN_EX}[{idx}/{total}] Processing: {item}{Fore.RESET}")
+            if self.args.isolate_jobs:
+                print(f"  Output dir: {job_args.output_dir}")
+            if log_fp:
+                print(f"  Log file:   {log_fp.name}")
+
+        try:
+            extractor = self.get_extractor(job_args)
+
+            # Tee logs to file while still showing console output
+            if log_fp and self.args.tee_logs:
+                tee_out = Tee(sys.stdout, log_fp)
+                tee_err = Tee(sys.stderr, log_fp)
+                with redirect_stdout(tee_out), redirect_stderr(tee_err):
+                    extractor.run()
+            elif log_fp and not self.args.tee_logs:
+                with redirect_stdout(log_fp), redirect_stderr(log_fp):
+                    extractor.run()
+            else:
+                extractor.run()
+
+        finally:
+            if log_fp:
+                log_fp.flush()
+                log_fp.close()
+
+            per_elapsed = time.time() - per_start
+            with self._print_lock:
+                print(
+                    f"{Fore.LIGHTGREEN_EX}[{idx}/{total}] Done in "
+                    f"{int(per_elapsed // 60)}:{int(per_elapsed % 60):02d}{Fore.RESET}\n"
+                )
+
+    def get_extractor(self, args):
+        # Batch/CLI: no interactive prompt here
+        if not args.link and args.filename:
+            return HianimeExtractor(args=args, name=args.filename)
+
+        if args.link and "hianime" in args.link:
+            return HianimeExtractor(args=args)
+        if args.link and "instagram.com" in args.link:
+            return InstagramExtractor(args=args)
+
+        return GeneralExtractor(args=args)
+
+    def parse_args(self):
+        parser = argparse.ArgumentParser(description="Anime downloader options")
+
+        parser.add_argument("--no-subtitles", action="store_true")
+
+        parser.add_argument("-o", "--output-dir", type=str, default="output")
+
+        parser.add_argument(
+            "-n",
+            "--filename",
+            type=str,
+            default="",
+            help="Used for anime name search, or base name of output file",
+        )
+
+        parser.add_argument("--aria", action="store_true", default=False)
+
+        parser.add_argument(
+            "-l",
+            "--link",
+            action="append",
+            default=[],
+            help="Provide link to desired content (repeatable)",
+        )
+
+        parser.add_argument("--links-file", type=str, default=None)
+
+        parser.add_argument("--server", type=str, default=None)
+
+        parser.add_argument(
+            "--continue-on-error",
+            action="store_true",
+            help="Continue batch even if one item fails",
+        )
+
+        parser.add_argument(
+            "-t",
+            "--threads",
+            type=int,
+            default=1,
+            help="Concurrent jobs (2-4 recommended to avoid rate limits)",
+        )
+
+        parser.add_argument(
+            "--isolate-jobs",
+            action="store_true",
+            default=False,
+            help="Put each job into its own output subfolder (prevents collisions)",
+        )
+
+        parser.add_argument(
+            "--no-isolate-jobs",
+            action="store_true",
+            default=False,
+            help="Disable auto job isolation when threads>1",
+        )
+
+        parser.add_argument(
+            "--log-dir",
+            type=str,
+            default=None,
+            help="Directory to write per-job logs",
+        )
+
+        parser.add_argument(
+            "--tee-logs",
+            action="store_true",
+            help="Write logs to file while still printing to console",
+        )
+
+        parser.add_argument(
+            "--allow-private-hosts",
+            action="store_true",
+            help="Allow URLs that resolve to private/loopback/link-local networks",
+        )
+
+        return parser.parse_args()
+
+
+if __name__ == "__main__":
+    start = time.time()
+    Main()
+    elapsed = time.time() - start
+    print(f"Took {int(elapsed // 60)}:{int(elapsed % 60):02d} to finish")
